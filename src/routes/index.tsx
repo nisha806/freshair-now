@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Wind,
   Thermometer,
@@ -11,8 +11,8 @@ import {
   AlertTriangle,
   BellOff,
 } from "lucide-react";
-import { nextReading, type Reading } from "@/lib/sensor";
-import { MetricCard } from "@/components/MetricCard";
+import { createSensor, type Reading } from "@/lib/sensor";
+import { MetricCard, type MetricAccent } from "@/components/MetricCard";
 import { AqiGauge } from "@/components/AqiGauge";
 import { AqiTrend, ClimateTrend } from "@/components/TrendChart";
 import { HistoryTable } from "@/components/HistoryTable";
@@ -21,7 +21,11 @@ export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Real-Time Air Quality Monitor" },
-      { name: "description", content: "Live IoT air quality dashboard with AQI, PM2.5, PM10, temperature, humidity and gas readings." },
+      {
+        name: "description",
+        content:
+          "Live IoT air quality dashboard with AQI, PM2.5, PM10, temperature, humidity and gas readings.",
+      },
     ],
   }),
   component: Dashboard,
@@ -29,17 +33,25 @@ export const Route = createFileRoute("/")({
 
 const AQI_THRESHOLD = 100;
 const MAX_HISTORY = 60;
+const TICK_MS = 5000;
+const ALERT_THROTTLE_MS = 30_000;
 
 function Dashboard() {
   const [history, setHistory] = useState<Reading[]>([]);
   const [notifGranted, setNotifGranted] = useState(false);
   const lastAlertRef = useRef(0);
+  const sensorRef = useRef<ReturnType<typeof createSensor> | null>(null);
+
+  // Lazily create sensor on the client to keep SSR pure.
+  if (sensorRef.current === null) {
+    sensorRef.current = createSensor();
+  }
 
   useEffect(() => {
-    // initial reading + interval
-    const tick = () => setHistory((h) => [...h, nextReading()].slice(-MAX_HISTORY));
+    const sensor = sensorRef.current!;
+    const tick = () => setHistory((h) => [...h, sensor.next()].slice(-MAX_HISTORY));
     tick();
-    const id = setInterval(tick, 5000);
+    const id = setInterval(tick, TICK_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -51,11 +63,10 @@ function Dashboard() {
 
   const latest = history[history.length - 1];
 
-  // Alert on unhealthy AQI (throttle 30s)
   useEffect(() => {
     if (!latest || latest.aqi <= AQI_THRESHOLD) return;
     const now = Date.now();
-    if (now - lastAlertRef.current < 30_000) return;
+    if (now - lastAlertRef.current < ALERT_THROTTLE_MS) return;
     lastAlertRef.current = now;
     if (notifGranted && typeof Notification !== "undefined") {
       new Notification("⚠️ Unhealthy Air Quality", {
@@ -64,11 +75,18 @@ function Dashboard() {
     }
   }, [latest, notifGranted]);
 
-  const requestNotif = async () => {
+  const requestNotif = useCallback(async () => {
     if (typeof Notification === "undefined") return;
     const res = await Notification.requestPermission();
     setNotifGranted(res === "granted");
-  };
+  }, []);
+
+  const accent: MetricAccent = useMemo(() => {
+    if (!latest) return "default";
+    if (latest.status === "Good") return "good";
+    if (latest.status === "Moderate") return "moderate";
+    return "unhealthy";
+  }, [latest]);
 
   if (!latest) {
     return (
@@ -78,8 +96,7 @@ function Dashboard() {
     );
   }
 
-  const accent =
-    latest.status === "Good" ? "good" : latest.status === "Moderate" ? "moderate" : "unhealthy";
+  const unhealthy = latest.aqi > AQI_THRESHOLD;
 
   return (
     <div className="min-h-screen bg-background">
@@ -87,7 +104,7 @@ function Dashboard() {
         <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-primary/10 p-2">
-              <Wind className="h-6 w-6 text-primary" />
+              <Wind className="h-6 w-6 text-primary" aria-hidden="true" />
             </div>
             <div>
               <h1 className="text-xl font-bold tracking-tight">Air Quality Monitor</h1>
@@ -96,17 +113,24 @@ function Dashboard() {
           </div>
           <div className="flex items-center gap-3">
             <span className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="relative flex h-2 w-2">
+              <span className="relative flex h-2 w-2" aria-hidden="true">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--good)] opacity-75" />
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--good)]" />
               </span>
               Live · updates every 5s
             </span>
             <button
+              type="button"
               onClick={requestNotif}
+              aria-label={notifGranted ? "Browser alerts enabled" : "Enable browser alerts"}
+              aria-pressed={notifGranted}
               className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium hover:bg-accent"
             >
-              {notifGranted ? <Bell className="h-3.5 w-3.5" /> : <BellOff className="h-3.5 w-3.5" />}
+              {notifGranted ? (
+                <Bell className="h-3.5 w-3.5" aria-hidden="true" />
+              ) : (
+                <BellOff className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
               {notifGranted ? "Alerts on" : "Enable alerts"}
             </button>
           </div>
@@ -114,9 +138,16 @@ function Dashboard() {
       </header>
 
       <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6">
-        {latest.aqi > AQI_THRESHOLD && (
-          <div className="flex items-start gap-3 rounded-xl border border-[var(--unhealthy)]/40 bg-[var(--unhealthy)]/10 p-4">
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[var(--unhealthy)]" />
+        {unhealthy && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="flex items-start gap-3 rounded-xl border border-[var(--unhealthy)]/40 bg-[var(--unhealthy)]/10 p-4"
+          >
+            <AlertTriangle
+              className="mt-0.5 h-5 w-5 shrink-0 text-[var(--unhealthy)]"
+              aria-hidden="true"
+            />
             <div>
               <p className="font-semibold text-[var(--unhealthy)]">Unhealthy air detected</p>
               <p className="text-sm text-muted-foreground">
@@ -148,22 +179,34 @@ function Dashboard() {
         </div>
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
-            <h2 className="mb-3 text-sm font-semibold">AQI Trend</h2>
+          <section
+            aria-labelledby="aqi-trend-heading"
+            className="rounded-xl border border-border bg-card p-5 shadow-sm"
+          >
+            <h2 id="aqi-trend-heading" className="mb-3 text-sm font-semibold">
+              AQI Trend
+            </h2>
             <div className="h-64">
               <AqiTrend history={history} />
             </div>
-          </div>
-          <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
-            <h2 className="mb-3 text-sm font-semibold">Temperature & Humidity</h2>
+          </section>
+          <section
+            aria-labelledby="climate-trend-heading"
+            className="rounded-xl border border-border bg-card p-5 shadow-sm"
+          >
+            <h2 id="climate-trend-heading" className="mb-3 text-sm font-semibold">
+              Temperature & Humidity
+            </h2>
             <div className="h-64">
               <ClimateTrend history={history} />
             </div>
-          </div>
+          </section>
         </div>
 
-        <section>
-          <h2 className="mb-3 text-sm font-semibold">Historical Readings</h2>
+        <section aria-labelledby="history-heading">
+          <h2 id="history-heading" className="mb-3 text-sm font-semibold">
+            Historical Readings
+          </h2>
           <HistoryTable history={history} />
         </section>
 
